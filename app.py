@@ -41,10 +41,15 @@ def index():
             outputs = model.predict(input_tensor, verbose=0)
             probabilities = outputs[0]
             
-            # 5) 확신도 및 결과 클래스 추출
-            confidence = np.max(probabilities) * 100
-            predicted_index = np.argmax(probabilities)
-            result = classes[predicted_index]
+            # 🟢 올바른 이진 분류(Sigmoid)용 코드
+            prob_value = probabilities[0] # 모델이 뱉은 0.0 ~ 1.0 사이의 단일 확률값
+
+            if prob_value >= 0.5:
+                result = "Dirty (더러움)"
+                confidence = prob_value * 100
+            else:
+                result = "Clean (깨끗함)"
+                confidence = (1.0 - prob_value) * 100
 
         except Exception as e:
             return f"이미지 처리 중 에러가 발생했습니다: {e}"
