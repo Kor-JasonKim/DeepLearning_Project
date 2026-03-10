@@ -1,14 +1,12 @@
-# app.py
+# app.py (흑백 전처리 통합본)
 import os
 import numpy as np
 import tensorflow as tf
 from tensorflow.keras.preprocessing import image
 from flask import Flask, render_template, request
-from preprocessing import classes, prepare_image_for_keras
 
-# 👉 주의: 파이토치용 'data_transforms'는 케라스에서 쓸 수 없으므로 제거했습니다!
-# 대신 'classes' 리스트만 가져옵니다. (예: classes = ['clean', 'dirty'])
-from preprocessing import classes 
+# ⭐️ 외부 파일(preprocessing.py)에서 불러오지 않고 직접 정의합니다.
+classes = ['clean', 'dirty']
 
 app = Flask(__name__)
 UPLOAD_FOLDER = 'uploads'
@@ -17,7 +15,6 @@ os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 # =========================================================
 # 1. Keras 모델 로드 (.keras 포맷)
 # =========================================================
-# 파이토치처럼 껍데기(모델 구조)를 미리 만들 필요 없이, 파일 하나만 부르면 끝납니다!
 model_path = 'resnet_room_clean_model.keras'
 model = tf.keras.models.load_model(model_path)
 
@@ -32,17 +29,27 @@ def index():
         file.save(file_path)
 
         # =========================================================
-        # 2. Keras AI 판독 프로세스
+        # 2. Keras AI 판독 프로세스 (흑백 전처리 포함)
         # =========================================================
         try:
-            input_tensor = prepare_image_for_keras(file_path)
-
-            # 4) 모델 예측 (verbose=0으로 터미널 로그를 깔끔하게 유지)
-            outputs = model.predict(input_tensor, verbose=0)
-            probabilities = outputs[0]
+            # 1) 이미지 로드 및 크기 조정
+            img = image.load_img(file_path, target_size=(256, 256))
+            img_array = image.img_to_array(img)
             
-            # 🟢 올바른 이진 분류(Sigmoid)용 코드
-            prob_value = probabilities[0] # 모델이 뱉은 0.0 ~ 1.0 사이의 단일 확률값
+            # ⭐️ 2) 흑백 변환 후 3채널 복제 (학습 및 검증 코드와 동일하게 맞춤!)
+            img_tensor = tf.convert_to_tensor(img_array)
+            gray_img = tf.image.rgb_to_grayscale(img_tensor)
+            gray_3ch_img = tf.image.grayscale_to_rgb(gray_img)
+            
+            # 3) 차원 추가 및 ResNet 전처리
+            input_tensor = tf.expand_dims(gray_3ch_img, axis=0)
+            input_tensor = tf.keras.applications.resnet50.preprocess_input(input_tensor)
+
+            # 4) 모델 예측
+            outputs = model.predict(input_tensor, verbose=0)
+            
+            # 5) 이진 분류(Sigmoid) 결과 해석
+            prob_value = outputs[0][0] 
 
             if prob_value >= 0.5:
                 result = "Dirty (더러움)"
@@ -54,7 +61,7 @@ def index():
         except Exception as e:
             return f"이미지 처리 중 에러가 발생했습니다: {e}"
 
-        # 결과 화면 (HTML 구조는 그대로 유지했습니다)
+        # 결과 화면
         return f"""
         <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
         <div class="container text-center" style="margin-top: 100px; max-width: 500px;">
