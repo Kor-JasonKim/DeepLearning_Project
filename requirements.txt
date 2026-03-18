@@ -1,0 +1,22 @@
+# Flask app
+flask>=2.0
+pymysql>=1.1.0
+python-dotenv>=1.0.0
+flask-login>=0.6.0
+
+# ResNet classifier (existing)
+tensorflow>=2.10
+
+# Preprocessing / data
+numpy>=1.20
+scikit-learn>=1.0
+joblib>=1.0
+
+# YOLO-based dirty scorer (object detection, YOLO26 models)
+ultralytics>=8.4.0
+opencv-python-headless>=4.5
+
+# SAM-based segmentation (object masks)
+torch>=2.0
+torchvision>=0.15
+segment-anything @ git+https://github.com/facebookresearch/segment-anything.git
