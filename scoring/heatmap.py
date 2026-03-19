@@ -9,52 +9,87 @@ model_path = "resnet_room_clean_model.keras"
 model = None
 
 # ---  데이터 전처리 및 Grad-CAM 함수  ---
-def get_img_array(img_path, size=(256, 256)):
+def get_img_array(img_path, size=(256, 256), use_grayscale=True):
+    """Load and preprocess image. use_grayscale=True for room model, False for desk (RGB)."""
     img = tf.keras.preprocessing.image.load_img(img_path, target_size=size)
     array = tf.keras.preprocessing.image.img_to_array(img)
     img_tensor = tf.convert_to_tensor(array)
-    gray_img = tf.image.rgb_to_grayscale(img_tensor)
-    gray_3ch_img = tf.image.grayscale_to_rgb(gray_img)
-    array = tf.expand_dims(gray_3ch_img, axis=0)
+    if use_grayscale:
+        gray_img = tf.image.rgb_to_grayscale(img_tensor)
+        img_tensor = tf.image.grayscale_to_rgb(gray_img)
+    array = tf.expand_dims(img_tensor, axis=0)
     return tf.keras.applications.resnet50.preprocess_input(array)
 
 def _get_gradcam_layers(full_model):
     """
     Resolve base (ResNet50), last conv, GAP, and Dense layers for Grad-CAM.
-    Works for both room and desk models (Sequential or Functional, any layer naming).
+    Works for both:
+      - room model (Sequential with nested 'resnet50' base)
+      - desk model (where 'conv5_block3_out' may live directly on the top-level model)
+    Includes fallback: find first submodel and its last Conv2D when name lookup fails.
     """
     base_model = None
-    # Try named ResNet50 layer first (room model saved from Sequential)
+    last_conv_layer = None
+
+    # 1) Prefer an explicitly named ResNet50 submodel if present
     try:
         base_model = full_model.get_layer("resnet50")
     except (ValueError, AttributeError):
-        pass
-    # Fallback: find a layer that contains conv5_block3_out (e.g. first layer in Sequential)
-    if base_model is None:
+        base_model = None
+
+    # 2) If conv5_block3_out exists directly on the top-level model, use that
+    if last_conv_layer is None:
+        for layer in full_model.layers:
+            if layer.name == "conv5_block3_out":
+                last_conv_layer = layer
+                if base_model is None:
+                    base_model = full_model
+                break
+
+    # 3) Otherwise, search nested layers for conv5_block3_out (room model fallback)
+    if last_conv_layer is None and base_model is None:
         for layer in full_model.layers:
             try:
-                layer.get_layer("conv5_block3_out")
+                nested = layer.get_layer("conv5_block3_out")
                 base_model = layer
+                last_conv_layer = nested
                 break
             except (ValueError, AttributeError):
                 continue
-    if base_model is None:
-        raise ValueError("Could not find ResNet50 base (layer with conv5_block3_out) in model")
 
-    last_conv_layer = base_model.get_layer("conv5_block3_out")
+    # 4) Fallback: first layer that is a Model (submodel), use its last Conv2D as heatmap source
+    if base_model is None or last_conv_layer is None:
+        for layer in full_model.layers:
+            if not isinstance(layer, tf.keras.Model):
+                continue
+            # Submodel: find last Conv2D (ResNet-style backbone)
+            last_conv = None
+            for sub in layer.layers:
+                if isinstance(sub, tf.keras.layers.Conv2D):
+                    last_conv = sub
+            if last_conv is not None:
+                base_model = layer
+                last_conv_layer = last_conv
+                break
+
+    if base_model is None or last_conv_layer is None:
+        raise ValueError(
+            "Could not find ResNet50 base or conv5_block3_out layer in model. "
+            "Top-level layer names: %s"
+            % ([l.name for l in full_model.layers],)
+        )
 
     # Resolve GAP and Dense by type (works for Sequential: base, GAP, Dense)
     gap_layer = None
     dense_layer = None
     for layer in full_model.layers:
-        if layer.name == base_model.name:
+        if layer is base_model or (hasattr(layer, "name") and layer.name == getattr(base_model, "name", None)):
             continue
         if isinstance(layer, tf.keras.layers.GlobalAveragePooling2D):
             gap_layer = layer
         if isinstance(layer, tf.keras.layers.Dense):
             dense_layer = layer
     if gap_layer is None or dense_layer is None:
-        # Fallback by index for Sequential [base, GAP, Dense]
         try:
             idx_base = full_model.layers.index(base_model)
             if idx_base + 2 < len(full_model.layers):
@@ -69,15 +104,34 @@ def _get_gradcam_layers(full_model):
 
 
 def make_gradcam_heatmap(img_array, full_model):
+    """
+    Compute Grad-CAM for either room or desk model.
+
+    We avoid manually reconstructing the head (GAP/Dense) and instead use the
+    original computation graph from full_model so it works for both:
+      - simple Sequential([base, GAP, Dense(1)]) room model
+      - deeper heads (e.g. GAP -> Dense(128) -> Dense(1)) desk model
+    """
     base_model, last_conv_layer, gap_layer, dense_layer = _get_gradcam_layers(full_model)
 
-    res_output = base_model.output
-    gap_output = gap_layer(res_output)
-    final_output = dense_layer(gap_output)
-    
+    x = base_model.output
+    passed_base = False
+    for layer in full_model.layers:
+        if layer is base_model or (
+            hasattr(layer, "name") and layer.name == getattr(base_model, "name", None)
+        ):
+            passed_base = True
+            continue
+        if not passed_base:
+            continue
+        x = layer(x)
+
+    # Build a model that maps from the base model input to:
+    #   - the last conv feature maps
+    #   - the final prediction scalar (recomputed head)
     grad_model = tf.keras.models.Model(
         inputs=[base_model.input],
-        outputs=[last_conv_layer.output, final_output]
+        outputs=[last_conv_layer.output, x],
     )
 
     with tf.GradientTape() as tape:
@@ -96,7 +150,7 @@ def make_gradcam_heatmap(img_array, full_model):
 # --- 청소 가이드 텍스트 생성 ---
 def generate_clean_guide(heatmap, label):
     if label == "Clean":
-        return "✨ 상태가 아주 좋습니다! 유지 관리만 신경 써주세요."
+        return "상태가 아주 좋습니다! 유지 관리만 신경 써주세요."
 
     h, w = heatmap.shape
     y_center, x_center = np.unravel_index(np.argmax(heatmap), heatmap.shape)
@@ -127,9 +181,9 @@ def visualize_single_heatmap(img_path, heatmap, label, confidence):
 
     # 1. 콘솔에 텍스트 결과 출력
     print("\n" + "="*50)
-    print(f"🔍 판독 파일: {os.path.basename(img_path)}")
-    print(f"📊 판정 결과: {label} ({confidence*100:.1f}%)")
-    print(f"💡 분석 가이드: {guide_text}")
+    print(f"판독 파일: {os.path.basename(img_path)}")
+    print(f"판정 결과: {label} ({confidence*100:.1f}%)")
+    print(f"분석 가이드: {guide_text}")
     print("="*50 + "\n")
 
     # 2. 히트맵 이미지만 단일 출력
@@ -207,13 +261,15 @@ def save_merged_overlay(img_path, full_model, yolo_result, out_path):
     return {"label": label, "confidence": confidence, "guide_text": guide_text}
 
 
-def save_heatmap_only(img_path, full_model, out_path):
+def save_heatmap_only(img_path, full_model, out_path, mode="room"):
     """
     Generate Grad-CAM heatmap only (no original image), at the original image's
     resolution, and save as PNG. Suitable for use as a toggleable overlay layer.
+    mode: "room" (grayscale input) or "desk" (RGB input), must match model training.
     """
     size = (full_model.input_shape[1], full_model.input_shape[2])
-    prepared_img = get_img_array(img_path, size=size)
+    use_grayscale = mode != "desk"
+    prepared_img = get_img_array(img_path, size=size, use_grayscale=use_grayscale)
     heatmap = make_gradcam_heatmap(prepared_img, full_model)
     prediction = full_model.predict(prepared_img, verbose=0)
     score = float(prediction[0][0])
